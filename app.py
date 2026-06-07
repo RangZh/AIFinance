@@ -4,6 +4,7 @@ import os
 import re
 import pdfplumber
 import plotly.express as px
+import json
 from openai import OpenAI
 from supabase import create_client
 
@@ -683,7 +684,9 @@ def read_pdf_file(uploaded_file):
     statement_type = detect_statement_type(text)
 
     st.write(f"识别账单类型：{statement_type}")
-
+    if statement_type == "unknown":
+        st.info("未知银行账单，正在使用AI识别...")
+        return parse_pdf_with_ai(text)
     if statement_type == "boa_deposit":
         return parse_boa_deposit_pdf(text)
 
@@ -696,8 +699,65 @@ def read_pdf_file(uploaded_file):
     if statement_type == "chase_checking":
         return parse_chase_checking_pdf(text)
 
-    return parse_generic_pdf(text)
+    result = parse_generic_pdf(text)
 
+    if len(result) > 0:
+        return result
+
+    return parse_pdf_with_ai(text)
+
+def parse_pdf_with_ai(text):
+
+    prompt = f"""
+你是银行账单解析助手。
+
+从下面账单中提取所有交易记录。
+
+返回JSON数组格式：
+
+[
+  {{
+    "Date":"2026-01-01",
+    "Description":"STARBUCKS",
+    "Amount":-8.5
+  }}
+]
+
+要求：
+
+1. 只返回JSON
+2. 不要解释
+3. 金额支出为负数
+4. 金额收入为正数
+
+账单内容：
+
+{text[:30000]}
+"""
+
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=prompt
+    )
+
+    try:
+
+        result = response.output_text
+
+        result = result.replace("```json", "")
+        result = result.replace("```", "")
+
+        transactions = json.loads(result)
+
+        return pd.DataFrame(transactions)
+
+    except Exception as e:
+
+        st.error(
+            f"AI解析失败: {e}"
+        )
+
+        return pd.DataFrame()
 
 def read_excel_file(uploaded_file):
     return pd.read_excel(uploaded_file)

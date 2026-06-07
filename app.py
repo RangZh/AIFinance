@@ -416,11 +416,13 @@ def detect_statement_type(text):
         return "boa_credit_card"
 
     if "BANK OF AMERICA" in upper_text and (
-        "ADVANTAGE SAVINGS" in upper_text
-        or "SAFEBALANCE BANKING" in upper_text
-        or "DEPOSITS AND OTHER ADDITIONS" in upper_text
-        or "ACCOUNT ACTIVITY" in upper_text
-    ):
+    "ADVANTAGE SAVINGS" in upper_text
+    or "SAFEBALANCE BANKING" in upper_text
+    or "DEPOSITS AND OTHER ADDITIONS" in upper_text
+    or "ACCOUNT ACTIVITY" in upper_text
+    or "POSTING DATE" in upper_text
+    or "PRINT TRANSACTION DETAILS" in upper_text
+):
         return "boa_deposit"
 
     if "CHASE TOTAL CHECKING" in upper_text or "JPMORGAN CHASE BANK" in upper_text:
@@ -688,7 +690,13 @@ def read_pdf_file(uploaded_file):
         st.info("未知银行账单，正在使用AI识别...")
         return parse_pdf_with_ai(text)
     if statement_type == "boa_deposit":
-        return parse_boa_deposit_pdf(text)
+        result = parse_boa_deposit_pdf(text)
+
+        if not result.empty:
+            return result
+
+        st.info("BOA规则解析失败，正在使用AI识别...")
+        return parse_pdf_with_ai(text)
 
     if statement_type == "boa_credit_card":
         return parse_boa_credit_card_pdf(text)
@@ -1105,6 +1113,160 @@ else:
                 st.success(f"已删除：{selected_file}")
                 st.rerun()
 
+# ======================
+# 月度报告
+# ======================
+
+st.subheader("月度报告")
+
+history_df = load_user_transactions(user_id)
+history_for_report = normalize_history_df(history_df)
+
+if history_for_report.empty:
+    st.info("暂无历史交易，保存账单后可生成月报")
+else:
+    report_df = history_for_report.copy()
+
+    report_df["Date"] = pd.to_datetime(
+        report_df["Date"],
+        errors="coerce"
+    )
+
+    report_df = report_df.dropna(subset=["Date"])
+
+    report_df["Month"] = report_df["Date"].dt.strftime("%Y-%m")
+
+    months = sorted(
+        report_df["Month"].dropna().unique().tolist(),
+        reverse=True
+    )
+
+    selected_month = st.selectbox(
+        "选择月份",
+        months
+    )
+
+    month_df = report_df[
+        report_df["Month"] == selected_month
+    ].copy()
+
+    real_month_df = month_df[
+        ~month_df["Category"].isin(IGNORE_CATEGORIES)
+    ].copy()
+
+    income = real_month_df[
+        real_month_df["Amount"] > 0
+    ]["Amount"].sum()
+
+    expense = abs(
+        real_month_df[
+            real_month_df["Amount"] < 0
+        ]["Amount"].sum()
+    )
+
+    net = income - expense
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "本月真实收入",
+        f"${income:,.2f}"
+    )
+
+    col2.metric(
+        "本月真实支出",
+        f"${expense:,.2f}"
+    )
+
+    col3.metric(
+        "本月净现金流",
+        f"${net:,.2f}"
+    )
+
+    # 支出分类
+    expense_df = real_month_df[
+        real_month_df["Amount"] < 0
+    ].copy()
+
+    expense_df["Amount"] = expense_df["Amount"].abs()
+
+    expense_summary = (
+        expense_df.groupby("Category")["Amount"]
+        .sum()
+        .reset_index()
+        .sort_values("Amount", ascending=False)
+    )
+
+    st.subheader("本月支出分类")
+
+    if expense_summary.empty:
+        st.info("本月没有支出记录")
+    else:
+        st.dataframe(expense_summary)
+
+        fig_month_expense = px.bar(
+            expense_summary,
+            x="Amount",
+            y="Category",
+            orientation="h",
+            title=f"{selected_month} 支出分类"
+        )
+
+        st.plotly_chart(
+            fig_month_expense,
+            use_container_width=True,
+            key=f"month_expense_{selected_month}"
+        )
+
+    # 收入分类
+    income_df = real_month_df[
+        real_month_df["Amount"] > 0
+    ].copy()
+
+    income_summary = (
+        income_df.groupby("Category")["Amount"]
+        .sum()
+        .reset_index()
+        .sort_values("Amount", ascending=False)
+    )
+
+    st.subheader("本月收入分类")
+
+    if income_summary.empty:
+        st.info("本月没有收入记录")
+    else:
+        st.dataframe(income_summary)
+
+        fig_month_income = px.bar(
+            income_summary,
+            x="Amount",
+            y="Category",
+            orientation="h",
+            title=f"{selected_month} 收入分类"
+        )
+
+        st.plotly_chart(
+            fig_month_income,
+            use_container_width=True,
+            key=f"month_income_{selected_month}"
+        )
+
+    # Top 10 支出交易
+    top_expenses = (
+        expense_df.sort_values("Amount", ascending=False)
+        .head(10)
+    )
+
+    st.subheader("本月Top 10支出")
+
+    if top_expenses.empty:
+        st.info("本月没有支出交易")
+    else:
+        st.dataframe(
+            top_expenses[
+                ["Date", "Description", "Amount", "Category", "SourceFile"]
+            ]
+        )
 
 # ======================
 # 云端历史交易

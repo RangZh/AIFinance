@@ -1,0 +1,5 @@
+- Streamlit Cloud 私有仓库经常授权失败
+- finance.db 不上传 GitHub
+- secrets.toml 加入 .gitignore
+- Supabase RLS 已修复
+- transaction 去重使用 unique_key

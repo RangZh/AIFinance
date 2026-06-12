@@ -1,7 +1,7 @@
 import pandas as pd
 import streamlit as st
 
-from services.classification import (
+from services import (
     CATEGORIES,
     ai_classify,
     classify_with_memory,

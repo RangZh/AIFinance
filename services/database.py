@@ -86,6 +86,22 @@ def load_user_rules(user_id, supabase):
     return pd.DataFrame(columns=["merchant", "category"])
 
 
+def load_global_rules(supabase):
+    try:
+        result = (
+            supabase.table("global_merchant_rules")
+            .select("merchant,category")
+            .execute()
+        )
+    except Exception:
+        return pd.DataFrame(columns=["merchant", "category"])
+
+    if result.data:
+        return pd.DataFrame(result.data)
+
+    return pd.DataFrame(columns=["merchant", "category"])
+
+
 def save_cloud_rule(user_id, merchant, category, supabase):
     merchant = str(merchant).upper().strip()
     category = str(category).strip()
@@ -103,6 +119,13 @@ def save_cloud_rule(user_id, merchant, category, supabase):
         )
 
         if existing.data:
+            (
+                supabase.table("merchant_rules")
+                .update({"category": category})
+                .eq("user_id", str(user_id))
+                .eq("merchant", merchant)
+                .execute()
+            )
             return
 
         supabase.table("merchant_rules").insert({
@@ -112,6 +135,34 @@ def save_cloud_rule(user_id, merchant, category, supabase):
         }).execute()
     except Exception as e:
         st.warning(f"云端记忆库保存失败：{e}")
+
+
+def save_global_rule(merchant, category, supabase, source="ai"):
+    merchant = str(merchant).upper().strip()
+    category = str(category).strip()
+
+    if not merchant or not category or category == "待分类":
+        return
+
+    try:
+        existing = (
+            supabase.table("global_merchant_rules")
+            .select("merchant")
+            .eq("merchant", merchant)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            return
+
+        supabase.table("global_merchant_rules").insert({
+            "merchant": merchant,
+            "category": category,
+            "source": source
+        }).execute()
+    except Exception as e:
+        st.warning(f"全局记忆库保存失败：{e}")
 
 
 def delete_transactions_by_statement(user_id, source_file, supabase):

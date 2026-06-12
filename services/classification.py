@@ -9,7 +9,7 @@ CATEGORIES = [
     "餐饮", "超市日用品", "交通加油", "住房", "水电网", "保险",
     "医疗", "教育", "电商收入", "电商物流", "电商进货",
     "摄影业务", "软件订阅", "转账还款", "退款", "投资",
-    "房贷", "银行手续费", "利息收入", "税费", "其他"
+    "房贷", "银行手续费", "利息收入", "税费", "其他", "待分类"
 ]
 
 
@@ -128,10 +128,6 @@ def classify_by_rules(description, rules_df):
 
 
 def classify_by_cloud_rules(description, cloud_rules_df):
-    quick = quick_classify(description)
-    if quick:
-        return quick
-
     desc = str(description).upper()
 
     if cloud_rules_df.empty:
@@ -147,10 +143,27 @@ def classify_by_cloud_rules(description, cloud_rules_df):
     return "待分类"
 
 
-def ai_classify(description, amount, client):
-    quick = quick_classify(description)
-    if quick:
-        return quick
+def classify_with_memory(description, user_rules_df, global_rules_df):
+    user_category = classify_by_cloud_rules(description, user_rules_df)
+    if user_category != "待分类":
+        return user_category
+
+    global_category = classify_by_cloud_rules(description, global_rules_df)
+    if global_category != "待分类":
+        return global_category
+
+    quick_category = quick_classify(description)
+    if quick_category:
+        return quick_category
+
+    return "待分类"
+
+
+def ai_classify(description, amount, client, use_quick_rules=True):
+    if use_quick_rules:
+        quick = quick_classify(description)
+        if quick:
+            return quick
 
     prompt = f"""
 你是一个银行账单分类助手。
@@ -163,7 +176,12 @@ def ai_classify(description, amount, client):
 交易描述：{description}
 金额：{amount}
 
-只返回类别名称，不要解释。
+要求：
+1. 尽可能选择最具体、最符合交易含义的类别。
+2. 只有交易确实属于杂项且无法归入其他明确类别时，才使用“其他”。
+3. 如果信息不足或你不确定，请返回“待分类”。
+4. 不要把“其他”作为默认或兜底类别。
+5. 只返回类别名称，不要解释。
 """
 
     response = client.responses.create(
@@ -174,6 +192,6 @@ def ai_classify(description, amount, client):
     result = response.output_text.strip()
 
     if result not in CATEGORIES:
-        return "其他"
+        return "待分类"
 
     return result

@@ -1,19 +1,42 @@
 import os
-import re
-import json
-import pdfplumber
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from openai import OpenAI
 from supabase import create_client
+from services.classification import (
+    CATEGORIES,
+    ai_classify,
+    classify_by_cloud_rules,
+    classify_by_rules,
+    load_rules,
+    save_rule,
+)
+from services.database import (
+    delete_transactions_by_statement,
+    load_user_rules,
+    load_user_transactions,
+    save_cloud_rule,
+    save_transactions_to_supabase,
+)
+from services.reporting import (
+    aggregate_expenses,
+    aggregate_income,
+    build_monthly_cashflow,
+    calculate_summary,
+    generate_ai_analysis,
+    get_top_spending,
+    prepare_report_df,
+)
+from statement_parsers import read_excel_file, read_pdf_file
+from transaction_model import (
+    normalize_date,
+)
 
 # ======================
 # 基础设置
 # ======================
 st.set_page_config(page_title="AI记账软件", layout="wide")
-
-RULES_FILE = "merchant_rules.csv"
 
 # Streamlit Cloud 的 Secrets 不一定自动进入环境变量，这里手动设置一下
 if "OPENAI_API_KEY" in st.secrets:
@@ -32,43 +55,12 @@ if "session" in st.session_state and st.session_state["session"] is not None:
         st.session_state["session"].refresh_token
     )
 
-CATEGORIES = [
-    "餐饮", "超市日用品", "交通加油", "住房", "水电网", "保险",
-    "医疗", "教育", "电商收入", "电商物流", "电商进货",
-    "摄影业务", "软件订阅", "转账还款", "退款", "投资",
-    "房贷", "银行手续费", "利息收入", "税费", "其他"
-]
-
+# Transaction contract:
+# - date uses YYYY-MM-DD
+# - month is always derived from date
+# - positive amount is money in; negative amount is money out
 # 不计入真实消费/真实收入的类别
 IGNORE_CATEGORIES = {"转账还款", "投资"}
-
-# 真实收入类别：收入汇总只看这些类别，避免餐饮/医疗等退款跑进收入
-INCOME_CATEGORIES = {
-    "电商收入",
-    "摄影业务",
-    "利息收入",
-    "退款"
-}
-
-# 真实消费类别：消费汇总只看这些类别
-EXPENSE_CATEGORIES = {
-    "餐饮",
-    "超市日用品",
-    "交通加油",
-    "住房",
-    "水电网",
-    "保险",
-    "医疗",
-    "教育",
-    "电商物流",
-    "电商进货",
-    "软件订阅",
-    "房贷",
-    "银行手续费",
-    "税费",
-    "其他"
-}
-
 
 # ======================
 # 用户登录 / 注册
@@ -129,689 +121,6 @@ def login_ui():
 
 
 # ======================
-# Supabase：交易与云端规则
-# ======================
-def make_cloud_unique_key(row, user_id):
-    return (
-        str(user_id)
-        + "|"
-        + str(row["Date"])
-        + "|"
-        + str(row["Description"])
-        + "|"
-        + str(float(row["Amount"]))
-        + "|"
-        + str(row.get("SourceFile", ""))
-    )
-
-
-def save_transactions_to_supabase(df, user_id):
-    saved_count = 0
-    skipped_count = 0
-
-    if df is None or df.empty:
-        return saved_count, skipped_count
-
-    for _, row in df.iterrows():
-        date_value = str(row["Date"])
-        description = str(row["Description"])
-        amount = float(row["Amount"])
-        category = str(row["Category"])
-        source_file = str(row.get("SourceFile", ""))
-
-        date_parsed = pd.to_datetime(date_value, errors="coerce")
-        month = date_parsed.strftime("%Y-%m") if pd.notna(date_parsed) else ""
-        unique_key = make_cloud_unique_key(row, user_id)
-
-        try:
-            existing = (
-                supabase.table("transactions")
-                .select("id")
-                .eq("user_id", str(user_id))
-                .eq("unique_key", unique_key)
-                .execute()
-            )
-
-            if existing.data:
-                skipped_count += 1
-                continue
-
-            record = {
-                "user_id": str(user_id),
-                "date": date_value,
-                "description": description,
-                "amount": amount,
-                "category": category,
-                "source_file": source_file,
-                "month": month,
-                "unique_key": unique_key
-            }
-
-            supabase.table("transactions").insert(record).execute()
-            saved_count += 1
-
-        except Exception as e:
-            skipped_count += 1
-            st.warning(f"有一条交易保存失败，已跳过：{description} / {amount} / {e}")
-
-    return saved_count, skipped_count
-
-
-def load_user_transactions(user_id):
-    result = (
-        supabase.table("transactions")
-        .select("*")
-        .eq("user_id", str(user_id))
-        .order("date", desc=True)
-        .execute()
-    )
-    return pd.DataFrame(result.data)
-
-
-def load_cloud_rules(user_id):
-    result = (
-        supabase.table("merchant_rules")
-        .select("*")
-        .eq("user_id", str(user_id))
-        .execute()
-    )
-
-    if result.data:
-        return pd.DataFrame(result.data)
-
-    return pd.DataFrame(columns=["merchant", "category"])
-
-
-def save_cloud_rule(user_id, merchant, category):
-    merchant = str(merchant).upper().strip()
-    category = str(category).strip()
-
-    if not merchant or not category or category == "待分类":
-        return
-
-    try:
-        existing = (
-            supabase.table("merchant_rules")
-            .select("id")
-            .eq("user_id", str(user_id))
-            .eq("merchant", merchant)
-            .execute()
-        )
-
-        if existing.data:
-            return
-
-        supabase.table("merchant_rules").insert({
-            "user_id": str(user_id),
-            "merchant": merchant,
-            "category": category
-        }).execute()
-    except Exception as e:
-        st.warning(f"云端记忆库保存失败：{e}")
-
-
-def delete_statement_by_file(user_id, source_file):
-    supabase.table("transactions") \
-        .delete() \
-        .eq("user_id", str(user_id)) \
-        .eq("source_file", source_file) \
-        .execute()
-
-
-# ======================
-# 本地记忆库
-# ======================
-def load_rules():
-    if os.path.exists(RULES_FILE):
-        return pd.read_csv(RULES_FILE)
-    return pd.DataFrame(columns=["merchant", "category"])
-
-
-def save_rule(merchant, category):
-    merchant = str(merchant).upper().strip()
-    category = str(category).strip()
-
-    if not merchant or not category or category == "待分类":
-        return
-
-    rules_df = load_rules()
-
-    exists = rules_df["merchant"].astype(str).str.upper().eq(merchant).any()
-
-    if not exists:
-        new_row = pd.DataFrame([{
-            "merchant": merchant,
-            "category": category
-        }])
-        rules_df = pd.concat([rules_df, new_row], ignore_index=True)
-        rules_df.to_csv(RULES_FILE, index=False)
-
-
-# ======================
-# 分类
-# ======================
-def quick_classify(description):
-    desc = str(description).upper()
-
-    if "INTEREST EARNED" in desc or "INTEREST CREDIT" in desc or "SAVINGS INTEREST" in desc:
-        return "利息收入"
-
-    if "FEDERAL WITHHOLDING" in desc or "FRANCHISE TAX" in desc:
-        return "税费"
-
-    if "WIRE TRANSFER FEE" in desc or "MONTHLY SERVICE FEE" in desc or "BANK CHARGE" in desc:
-        return "银行手续费"
-
-    if "ETSY" in desc or "EBAY" in desc or "TIKTOK" in desc:
-        return "电商收入"
-
-    if "DOORDASH" in desc or "WALMART INC DES:PAYMENT" in desc or "WALMART INC DES:TIPS" in desc:
-        return "电商收入"
-
-    if "COSTCO" in desc or "WALMART" in desc or "TARGET" in desc or "MURRIETA GROCERY" in desc:
-        return "超市日用品"
-
-    if "SHELL" in desc or "CHEVRON" in desc or "ARCO" in desc or "COSTCO GAS" in desc:
-        return "交通加油"
-
-    if "STATE FARM" in desc or "GEICO" in desc:
-        return "保险"
-
-    if "ADOBE" in desc or "OPENAI" in desc or "CHATGPT" in desc or "CAPCUT" in desc:
-        return "软件订阅"
-
-    if "USPS" in desc or "UPS" in desc or "FEDEX" in desc or "PIRATE SHIP" in desc:
-        return "电商物流"
-
-    if "SCHWAB" in desc or "BETTERMENT" in desc or "AMERICAN FUNDS" in desc or "FIDELITY" in desc or "VANGUARD" in desc:
-        return "投资"
-
-    if "PACIFIC LANDING" in desc:
-        return "房贷"
-
-    if "SO CAL EDISON" in desc or "SOCALGAS" in desc or "FRONTIER" in desc:
-        return "水电网"
-
-    if "KAISER" in desc:
-        return "医疗"
-
-    if "MCDONALD" in desc or "IN-N-OUT" in desc or "DOMINO" in desc or "PHO HA" in desc or "FIVE GUYS" in desc or "RAISING CANE" in desc or "STARBUCKS" in desc:
-        return "餐饮"
-
-    if "ONLINE BANKING TRANSFER" in desc:
-        return "转账还款"
-
-    if "ONLINE TRANSFER" in desc:
-        return "转账还款"
-
-    if "MOBILE BANKING PAYMENT" in desc:
-        return "转账还款"
-
-    if "PAYMENT FROM" in desc:
-        return "转账还款"
-
-    if "WIRE TYPE:WIRE IN" in desc or "WIRE TYPE:WIRE OUT" in desc or "WIRE TYPE:INTL IN" in desc or "WIRE TYPE:BOOK IN" in desc:
-        return "转账还款"
-
-    if "WIRE OUT" in desc or "WIRE IN" in desc:
-        return "转账还款"
-
-    if "ZELLE PAYMENT" in desc:
-        return "转账还款"
-
-    return None
-
-
-def classify_by_rules(description, rules_df):
-    quick = quick_classify(description)
-    if quick:
-        return quick
-
-    desc = str(description).upper()
-
-    for _, row in rules_df.iterrows():
-        merchant = str(row.get("merchant", "")).upper()
-        category = row.get("category", "待分类")
-
-        if merchant and merchant in desc:
-            return category
-
-    return "待分类"
-
-
-def classify_by_cloud_rules(description, cloud_rules_df):
-    quick = quick_classify(description)
-    if quick:
-        return quick
-
-    desc = str(description).upper()
-
-    if cloud_rules_df.empty:
-        return "待分类"
-
-    for _, row in cloud_rules_df.iterrows():
-        merchant = str(row.get("merchant", "")).upper()
-        category = row.get("category", "待分类")
-
-        if merchant and merchant in desc:
-            return category
-
-    return "待分类"
-
-
-def ai_classify(description, amount):
-    quick = quick_classify(description)
-    if quick:
-        return quick
-
-    prompt = f"""
-你是一个银行账单分类助手。
-
-请根据交易描述和金额判断类别。
-
-只能从下面类别中选择一个：
-{CATEGORIES}
-
-交易描述：{description}
-金额：{amount}
-
-只返回类别名称，不要解释。
-"""
-
-    response = client.responses.create(
-        model="gpt-5-mini",
-        input=prompt
-    )
-
-    result = response.output_text.strip()
-
-    if result not in CATEGORIES:
-        return "其他"
-
-    return result
-
-
-# ======================
-# PDF / Excel 解析
-# ======================
-def extract_pdf_text(uploaded_file):
-    text = ""
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
-
-
-def detect_statement_type(text):
-    upper_text = text.upper()
-
-    if "SYNCHRONY BANK" in upper_text or "AMAZON.SYF.COM" in upper_text:
-        return "amazon_synchrony"
-
-    if "VISA SIGNATURE" in upper_text and "BANK OF AMERICA" in upper_text:
-        return "boa_credit_card"
-
-    if "BANK OF AMERICA" in upper_text and (
-        "ADVANTAGE SAVINGS" in upper_text
-        or "SAFEBALANCE BANKING" in upper_text
-        or "DEPOSITS AND OTHER ADDITIONS" in upper_text
-        or "ACCOUNT ACTIVITY" in upper_text
-        or "POSTING DATE" in upper_text
-        or "PRINT TRANSACTION DETAILS" in upper_text
-    ):
-        return "boa_deposit"
-
-    if "CHASE TOTAL CHECKING" in upper_text or "JPMORGAN CHASE BANK" in upper_text:
-        return "chase_checking"
-
-    return "unknown"
-
-
-def normalize_date(date_text):
-    date_text = str(date_text).strip()
-
-    if re.match(r"^\d{2}/\d{2}/\d{2}$", date_text):
-        parsed = pd.to_datetime(date_text, format="%m/%d/%y", errors="coerce")
-        if pd.notna(parsed):
-            return parsed.strftime("%m/%d/%Y")
-
-    if re.match(r"^\d{2}/\d{2}/\d{4}$", date_text):
-        return date_text
-
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_text):
-        parsed = pd.to_datetime(date_text, errors="coerce")
-        if pd.notna(parsed):
-            return parsed.strftime("%m/%d/%Y")
-
-    if re.match(r"^\d{2}/\d{2}$", date_text):
-        return date_text + "/2026"
-
-    return date_text
-
-
-def parse_amount(amount_text):
-    amount_text = str(amount_text)
-    amount_text = amount_text.replace("$", "")
-    amount_text = amount_text.replace(",", "")
-    amount_text = amount_text.replace("−", "-")
-    return float(amount_text)
-
-
-def parse_boa_deposit_pdf(text):
-    transactions = []
-    lines = text.splitlines()
-    section = None
-    current = None
-
-    def flush_current():
-        if current:
-            transactions.append(current.copy())
-
-    for line in lines:
-        raw = line.strip()
-        upper = raw.upper()
-
-        if not raw:
-            continue
-
-        if "DEPOSITS AND OTHER ADDITIONS" in upper:
-            flush_current()
-            current = None
-            section = "deposit"
-            continue
-
-        if "WITHDRAWALS AND OTHER SUBTRACTIONS" in upper:
-            flush_current()
-            current = None
-            section = "withdrawal"
-            continue
-
-        if upper.startswith("TOTAL DEPOSITS") or upper.startswith("TOTAL OTHER SUBTRACTIONS") or upper.startswith("TOTAL ATM"):
-            flush_current()
-            current = None
-            section = None
-            continue
-
-        if section not in ["deposit", "withdrawal"]:
-            continue
-
-        match = re.match(
-            r"^(\d{2}/\d{2}/\d{2})\s+(.+?)\s+(-?\$?[\d,]+\.\d{2})$",
-            raw
-        )
-
-        if match:
-            flush_current()
-            date, desc, amount = match.groups()
-            amount = parse_amount(amount)
-
-            if section == "withdrawal" and amount > 0:
-                amount = -amount
-
-            current = {
-                "Date": normalize_date(date),
-                "Description": desc.strip(),
-                "Amount": amount
-            }
-        else:
-            if current and not upper.startswith("DATE DESCRIPTION AMOUNT"):
-                current["Description"] += " " + raw
-
-    flush_current()
-    return pd.DataFrame(transactions)
-
-
-def parse_boa_credit_card_pdf(text):
-    transactions = []
-    lines = text.splitlines()
-    section = None
-
-    for line in lines:
-        raw = line.strip()
-        upper = raw.upper()
-
-        if not raw:
-            continue
-
-        if "PAYMENTS AND OTHER CREDITS" in upper:
-            section = "credit"
-            continue
-
-        if "PURCHASES AND ADJUSTMENTS" in upper:
-            section = "purchase"
-            continue
-
-        if "TOTAL PAYMENTS AND OTHER CREDITS" in upper or "TOTAL PURCHASES AND ADJUSTMENTS" in upper:
-            section = None
-            continue
-
-        if section not in ["credit", "purchase"]:
-            continue
-
-        match = re.match(
-            r"^(\d{2}/\d{2})\s+(\d{2}/\d{2})\s+(.+?)\s+\d{4}\s+\d{4}\s+(-?[\d,]+\.\d{2})$",
-            raw
-        )
-
-        if match:
-            trans_date, post_date, desc, amount = match.groups()
-            amount = parse_amount(amount)
-
-            if section == "credit" and amount > 0:
-                amount = -amount
-
-            transactions.append({
-                "Date": normalize_date(trans_date),
-                "Description": desc.strip(),
-                "Amount": amount
-            })
-
-    return pd.DataFrame(transactions)
-
-
-def parse_amazon_synchrony_pdf(text):
-    transactions = []
-    lines = text.splitlines()
-    section = None
-
-    for line in lines:
-        raw = line.strip()
-        upper = raw.upper()
-
-        if not raw:
-            continue
-
-        if "PAYMENTS" in upper and "TOTAL" not in upper:
-            section = "credit"
-            continue
-
-        if "OTHER CREDITS" in upper and "TOTAL" not in upper:
-            section = "credit"
-            continue
-
-        if "PURCHASES AND OTHER DEBITS" in upper:
-            section = "purchase"
-            continue
-
-        if section not in ["credit", "purchase"]:
-            continue
-
-        match = re.match(
-            r"^(\d{2}/\d{2})\s+\S+\s+(.+?)\s+\$?(-?[\d,]+\.\d{2})$",
-            raw
-        )
-
-        if match:
-            date, desc, amount = match.groups()
-            amount = parse_amount(amount)
-
-            if section == "credit" and amount > 0:
-                amount = -amount
-
-            transactions.append({
-                "Date": normalize_date(date),
-                "Description": desc.strip(),
-                "Amount": amount
-            })
-
-    return pd.DataFrame(transactions)
-
-
-def parse_chase_checking_pdf(text):
-    transactions = []
-    lines = text.splitlines()
-    in_detail = False
-
-    for line in lines:
-        raw = line.strip()
-        upper = raw.upper()
-
-        if "TRANSACTION DETAIL" in upper:
-            in_detail = True
-            continue
-
-        if "DAILY ENDING BALANCE" in upper or "SERVICE FEE SUMMARY" in upper:
-            in_detail = False
-            continue
-
-        if not in_detail:
-            continue
-
-        match = re.match(
-            r"^(\d{2}/\d{2})\s+(.+?)\s+(-?[\d,]+\.\d{2})\s+[\d,]+\.\d{2}$",
-            raw
-        )
-
-        if match:
-            date, desc, amount = match.groups()
-            amount = parse_amount(amount)
-
-            transactions.append({
-                "Date": normalize_date(date),
-                "Description": desc.strip(),
-                "Amount": amount
-            })
-
-    return pd.DataFrame(transactions)
-
-
-def parse_generic_pdf(text):
-    pattern = r"(\d{2}/\d{2}/\d{4})(.*?)([-]?\$?[\d,]+\.\d{2})"
-    matches = re.findall(pattern, text, re.DOTALL)
-    transactions = []
-
-    for date, desc, amount in matches:
-        desc = desc.replace("\n", " ").strip()
-
-        if "VIEW: TODAY" in desc.upper():
-            continue
-
-        amount = parse_amount(amount)
-
-        transactions.append({
-            "Date": normalize_date(date),
-            "Description": desc,
-            "Amount": amount
-        })
-
-    return pd.DataFrame(transactions)
-
-
-def parse_pdf_with_ai(text):
-    prompt = f"""
-你是银行账单解析助手。
-
-从下面账单中提取所有交易记录。
-
-返回JSON数组格式：
-[
-  {{"Date":"2026-01-01", "Description":"STARBUCKS", "Amount":-8.5}}
-]
-
-要求：
-1. 只返回JSON
-2. 不要解释
-3. 金额支出为负数
-4. 金额收入为正数
-5. 如果原文没有年份，请尽量根据账单上下文补全年份
-
-账单内容：
-{text[:30000]}
-"""
-
-    response = client.responses.create(
-        model="gpt-5-mini",
-        input=prompt
-    )
-
-    try:
-        result = response.output_text.strip()
-        result = result.replace("```json", "").replace("```", "").strip()
-        transactions = json.loads(result)
-        df = pd.DataFrame(transactions)
-
-        required_cols = {"Date", "Description", "Amount"}
-        if not required_cols.issubset(set(df.columns)):
-            st.error("AI解析结果缺少 Date / Description / Amount 列")
-            return pd.DataFrame()
-
-        df["Date"] = df["Date"].apply(normalize_date)
-        df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
-        df = df.dropna(subset=["Amount"])
-        return df
-
-    except Exception as e:
-        st.error(f"AI解析失败: {e}")
-        return pd.DataFrame()
-
-
-def read_pdf_file(uploaded_file):
-    text = extract_pdf_text(uploaded_file)
-    statement_type = detect_statement_type(text)
-
-    st.write(f"识别账单类型：{statement_type}")
-
-    if statement_type == "boa_deposit":
-        result = parse_boa_deposit_pdf(text)
-        if not result.empty:
-            return result
-        st.info("未匹配标准银行月结单格式，正在使用AI识别...")
-        return parse_pdf_with_ai(text)
-
-    if statement_type == "boa_credit_card":
-        result = parse_boa_credit_card_pdf(text)
-        if not result.empty:
-            return result
-        st.info("信用卡规则解析失败，正在使用AI识别...")
-        return parse_pdf_with_ai(text)
-
-    if statement_type == "amazon_synchrony":
-        result = parse_amazon_synchrony_pdf(text)
-        if not result.empty:
-            return result
-        return parse_pdf_with_ai(text)
-
-    if statement_type == "chase_checking":
-        result = parse_chase_checking_pdf(text)
-        if not result.empty:
-            return result
-        return parse_pdf_with_ai(text)
-
-    result = parse_generic_pdf(text)
-    if not result.empty:
-        return result
-
-    st.info("未匹配标准银行月结单格式，正在使用AI识别...")
-    return parse_pdf_with_ai(text)
-
-
-def read_excel_file(uploaded_file):
-    return pd.read_excel(uploaded_file)
-
-
-# ======================
 # 数据标准化与统计
 # ======================
 def normalize_history_df(history_df):
@@ -824,40 +133,22 @@ def normalize_history_df(history_df):
             "description": "Description",
             "amount": "Amount",
             "category": "Category",
-            "source_file": "SourceFile"
+            "source_file": "SourceFile",
+            "month": "Month",
+            "unique_key": "UniqueKey",
         }
     )
 
+    if "Date" in df.columns:
+        df["Date"] = df["Date"].apply(normalize_date)
+        df = df[df["Date"] != ""]
+        df["Month"] = df["Date"].str[:7]
+
     if "Amount" in df.columns:
         df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+        df = df[df["Amount"].notna()]
 
     return df
-
-
-def prepare_report_df(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    report_df = df.copy()
-    report_df["Date"] = pd.to_datetime(report_df["Date"], errors="coerce")
-    report_df = report_df.dropna(subset=["Date"])
-    report_df["Month"] = report_df["Date"].dt.strftime("%Y-%m")
-    return report_df
-
-
-def calculate_summary(df):
-    if df is None or df.empty:
-        return 0.0, 0.0, 0.0, 0
-
-    real_income_df = df[df["Category"].isin(INCOME_CATEGORIES)].copy()
-    real_expense_df = df[df["Category"].isin(EXPENSE_CATEGORIES)].copy()
-
-    income = real_income_df["Amount"].abs().sum()
-    expense = real_expense_df["Amount"].abs().sum()
-    net = income - expense
-    count = len(df)
-
-    return income, expense, net, count
 
 
 def show_metric_cards(df):
@@ -889,18 +180,10 @@ def show_financial_summary(df, key_prefix="summary"):
     col3.metric("净现金流", f"${net:,.2f}")
     col4.metric("交易数量", count)
 
-    expense_df = df[df["Category"].isin(EXPENSE_CATEGORIES)].copy()
-    expense_df["Amount"] = expense_df["Amount"].abs()
-
-    category_summary = (
-        expense_df.groupby("Category")["Amount"]
-        .sum()
-        .reset_index()
-        .sort_values("Amount", ascending=False)
-    )
+    expense_df, category_summary = aggregate_expenses(df)
 
     st.subheader("消费分类汇总")
-    st.dataframe(category_summary, use_container_width=True)
+    st.dataframe(category_summary, width="stretch")
 
     st.subheader("消费分类明细")
     for category in category_summary["Category"]:
@@ -908,7 +191,7 @@ def show_financial_summary(df, key_prefix="summary"):
         category_total = category_detail["Amount"].sum()
         with st.expander(f"{category} - ${category_total:,.2f}"):
             show_cols = [c for c in ["Date", "Description", "Amount", "SourceFile"] if c in category_detail.columns]
-            st.dataframe(category_detail[show_cols], use_container_width=True)
+            st.dataframe(category_detail[show_cols], width="stretch")
 
     if not category_summary.empty:
         fig_expense = px.bar(
@@ -918,20 +201,12 @@ def show_financial_summary(df, key_prefix="summary"):
             orientation="h",
             title="真实消费分类图"
         )
-        st.plotly_chart(fig_expense, use_container_width=True, key=f"{key_prefix}_expense_chart")
+        st.plotly_chart(fig_expense, width="stretch", key=f"{key_prefix}_expense_chart")
 
-    income_df = df[df["Category"].isin(INCOME_CATEGORIES)].copy()
-    income_df["Amount"] = income_df["Amount"].abs()
-
-    income_summary = (
-        income_df.groupby("Category")["Amount"]
-        .sum()
-        .reset_index()
-        .sort_values("Amount", ascending=False)
-    )
+    _income_df, income_summary = aggregate_income(df)
 
     st.subheader("收入分类汇总")
-    st.dataframe(income_summary, use_container_width=True)
+    st.dataframe(income_summary, width="stretch")
 
     if not income_summary.empty:
         fig_income = px.bar(
@@ -941,26 +216,14 @@ def show_financial_summary(df, key_prefix="summary"):
             orientation="h",
             title="收入分类图"
         )
-        st.plotly_chart(fig_income, use_container_width=True, key=f"{key_prefix}_income_chart")
+        st.plotly_chart(fig_income, width="stretch", key=f"{key_prefix}_income_chart")
 
-    report_df = prepare_report_df(df)
-    if report_df.empty:
+    monthly_cashflow = build_monthly_cashflow(df)
+    if monthly_cashflow.empty:
         return
 
-    monthly_summary = []
-    for month, month_df in report_df.groupby("Month"):
-        month_income, month_expense, month_net, _ = calculate_summary(month_df)
-        monthly_summary.append({
-            "Month": month,
-            "Income": month_income,
-            "Expense": month_expense,
-            "NetCashFlow": month_net
-        })
-
-    monthly_cashflow = pd.DataFrame(monthly_summary).sort_values("Month")
-
     st.subheader("月度现金流")
-    st.dataframe(monthly_cashflow.round(2), use_container_width=True)
+    st.dataframe(monthly_cashflow.round(2), width="stretch")
 
     if not monthly_cashflow.empty:
         fig_cashflow = px.line(
@@ -970,7 +233,7 @@ def show_financial_summary(df, key_prefix="summary"):
             markers=True,
             title="月度现金流趋势"
         )
-        st.plotly_chart(fig_cashflow, use_container_width=True, key=f"{key_prefix}_cashflow_chart")
+        st.plotly_chart(fig_cashflow, width="stretch", key=f"{key_prefix}_cashflow_chart")
 
 
 def show_monthly_report(history_for_report, user_id):
@@ -999,28 +262,20 @@ def show_monthly_report(history_for_report, user_id):
     col3.metric("本月净现金流", f"${net:,.2f}")
     col4.metric("本月交易数量", count)
 
-    expense_df = month_df[month_df["Category"].isin(EXPENSE_CATEGORIES)].copy()
-    expense_df["Amount"] = expense_df["Amount"].abs()
-
-    expense_summary = (
-        expense_df.groupby("Category")["Amount"]
-        .sum()
-        .reset_index()
-        .sort_values("Amount", ascending=False)
-    )
+    expense_df, expense_summary = aggregate_expenses(month_df)
 
     st.subheader("本月支出分类")
     if expense_summary.empty:
         st.info("本月没有真实支出记录")
     else:
-        st.dataframe(expense_summary, use_container_width=True)
+        st.dataframe(expense_summary, width="stretch")
 
         for category in expense_summary["Category"]:
             detail = expense_df[expense_df["Category"] == category].copy()
             total = detail["Amount"].sum()
             with st.expander(f"{category} - ${total:,.2f}"):
                 show_cols = [c for c in ["Date", "Description", "Amount", "SourceFile"] if c in detail.columns]
-                st.dataframe(detail[show_cols], use_container_width=True)
+                st.dataframe(detail[show_cols], width="stretch")
 
         fig_month_expense = px.bar(
             expense_summary,
@@ -1029,23 +284,15 @@ def show_monthly_report(history_for_report, user_id):
             orientation="h",
             title=f"{selected_month} 支出分类"
         )
-        st.plotly_chart(fig_month_expense, use_container_width=True, key=f"month_expense_{selected_month}")
+        st.plotly_chart(fig_month_expense, width="stretch", key=f"month_expense_{selected_month}")
 
-    income_df = month_df[month_df["Category"].isin(INCOME_CATEGORIES)].copy()
-    income_df["Amount"] = income_df["Amount"].abs()
-
-    income_summary = (
-        income_df.groupby("Category")["Amount"]
-        .sum()
-        .reset_index()
-        .sort_values("Amount", ascending=False)
-    )
+    _income_df, income_summary = aggregate_income(month_df)
 
     st.subheader("本月收入分类")
     if income_summary.empty:
         st.info("本月没有收入记录")
     else:
-        st.dataframe(income_summary, use_container_width=True)
+        st.dataframe(income_summary, width="stretch")
 
         fig_month_income = px.bar(
             income_summary,
@@ -1054,59 +301,32 @@ def show_monthly_report(history_for_report, user_id):
             orientation="h",
             title=f"{selected_month} 收入分类"
         )
-        st.plotly_chart(fig_month_income, use_container_width=True, key=f"month_income_{selected_month}")
+        st.plotly_chart(fig_month_income, width="stretch", key=f"month_income_{selected_month}")
 
     st.subheader("本月主要资金流出")
-    outflow_df = month_df[month_df["Amount"] < 0].copy()
-    outflow_df["Amount"] = outflow_df["Amount"].abs()
-    outflow_top10 = outflow_df.sort_values("Amount", ascending=False).head(10)
+    outflow_top10 = get_top_spending(month_df)
 
     if outflow_top10.empty:
         st.info("本月没有资金流出")
     else:
         show_cols = [c for c in ["Date", "Description", "Amount", "Category", "SourceFile"] if c in outflow_top10.columns]
-        st.dataframe(outflow_top10[show_cols], use_container_width=True)
+        st.dataframe(outflow_top10[show_cols], width="stretch")
 
     if st.button("生成AI财务分析", key=f"ai_report_{selected_month}"):
         with st.spinner("AI正在分析本月财务..."):
-            expense_summary_text = expense_summary.to_string(index=False) if not expense_summary.empty else "无"
-            income_summary_text = income_summary.to_string(index=False) if not income_summary.empty else "无"
-            outflow_text = outflow_top10[["Description", "Amount", "Category"]].to_string(index=False) if not outflow_top10.empty else "无"
-
-            prompt = f"""
-你是一位专业但务实的个人财务分析助手。
-
-请根据以下月度财务数据，生成一份通俗易懂的中文财务分析。
-
-月份：{selected_month}
-真实收入：{income}
-真实支出：{expense}
-净现金流：{net}
-
-收入分类：
-{income_summary_text}
-
-真实支出分类：
-{expense_summary_text}
-
-主要资金流出：
-{outflow_text}
-
-要求：
-1. 严格根据实际账单分析，不要编造。
-2. 如果数据不足，不要给出长期投资建议。
-3. 重点分析收入来源、主要支出、异常资金流出、资金流动特点。
-4. 禁止输出应急基金建议、提前还房贷建议、投资建议，除非账单明确显示相关信息。
-5. 控制在300字以内。
-"""
-
-            response = client.responses.create(
-                model="gpt-5-mini",
-                input=prompt
+            analysis = generate_ai_analysis(
+                client,
+                selected_month,
+                income,
+                expense,
+                net,
+                income_summary,
+                expense_summary,
+                outflow_top10,
             )
 
             st.subheader("🤖 AI财务分析")
-            st.write(response.output_text)
+            st.write(analysis)
 
 
 # ======================
@@ -1118,7 +338,7 @@ if st.sidebar.button("测试 Supabase 连接"):
     supabase.table("transactions").select("*").limit(1).execute()
     st.sidebar.success("Supabase 连接成功")
 
-history_df = load_user_transactions(user_id)
+history_df = load_user_transactions(user_id, supabase)
 history_for_summary = normalize_history_df(history_df)
 
 st.title("AI记账软件")
@@ -1165,7 +385,7 @@ with tab2:
             if uploaded_file.name.lower().endswith(".xlsx"):
                 temp_df = read_excel_file(uploaded_file)
             elif uploaded_file.name.lower().endswith(".pdf"):
-                temp_df = read_pdf_file(uploaded_file)
+                temp_df = read_pdf_file(uploaded_file, client)
             else:
                 continue
 
@@ -1178,10 +398,19 @@ with tab2:
         else:
             df = pd.concat(all_dataframes, ignore_index=True)
 
-            if "Description" not in df.columns or "Amount" not in df.columns:
-                st.error("账单缺少 Description 或 Amount 列，无法处理")
+            required_columns = {"Date", "Description", "Amount"}
+            if not required_columns.issubset(df.columns):
+                st.error("账单缺少 Date、Description 或 Amount 列，无法处理")
             else:
-                cloud_rules_df = load_cloud_rules(user_id)
+                df["Date"] = df["Date"].apply(normalize_date)
+                invalid_date_count = int((df["Date"] == "").sum())
+                if invalid_date_count:
+                    st.warning(
+                        f"已跳过 {invalid_date_count} 条日期无效或缺少年份的交易"
+                    )
+                    df = df[df["Date"] != ""].copy()
+
+                cloud_rules_df = load_user_rules(user_id, supabase)
                 local_rules_df = load_rules()
 
                 def classify_transaction(description):
@@ -1203,16 +432,25 @@ with tab2:
                             for index, row in pending_df.iterrows():
                                 description = row["Description"]
                                 amount = row["Amount"]
-                                category = ai_classify(description, amount)
+                                category = ai_classify(
+                                    description,
+                                    amount,
+                                    client
+                                )
                                 df.at[index, "Category"] = category
                                 save_rule(description, category)
-                                save_cloud_rule(user_id, description, category)
+                                save_cloud_rule(
+                                    user_id,
+                                    description,
+                                    category,
+                                    supabase
+                                )
                         st.success("AI分类完成，并已写入记忆库")
 
                 st.subheader("分类结果（可手动修改类别）")
                 edited_df = st.data_editor(
                     df,
-                    use_container_width=True,
+                    width="stretch",
                     num_rows="fixed",
                     column_config={
                         "Category": st.column_config.SelectboxColumn(
@@ -1229,12 +467,21 @@ with tab2:
                     if st.button("保存分类到记忆库", key="save_rules_from_edit"):
                         for _, row in edited_df.iterrows():
                             save_rule(row["Description"], row["Category"])
-                            save_cloud_rule(user_id, row["Description"], row["Category"])
+                            save_cloud_rule(
+                                user_id,
+                                row["Description"],
+                                row["Category"],
+                                supabase
+                            )
                         st.success("已保存分类记忆，下次类似交易会自动识别")
 
                 with col_b:
                     if st.button("保存到账户", key="save_transactions"):
-                        saved_count, skipped_count = save_transactions_to_supabase(edited_df, user_id)
+                        saved_count, skipped_count = save_transactions_to_supabase(
+                            edited_df,
+                            user_id,
+                            supabase
+                        )
                         st.success(f"保存完成：新增 {saved_count} 条，跳过重复 {skipped_count} 条")
 
                 st.divider()
@@ -1275,7 +522,7 @@ with tab4:
             filtered_df = filtered_df[filtered_df["SourceFile"] == selected_file]
 
         st.caption("默认显示最近100条交易")
-        st.dataframe(filtered_df.head(100), use_container_width=True)
+        st.dataframe(filtered_df.head(100), width="stretch")
 
 # ========== 账单管理 ==========
 with tab5:
@@ -1300,7 +547,7 @@ with tab5:
             )
 
             st.subheader("已上传账单")
-            st.dataframe(statement_summary, use_container_width=True)
+            st.dataframe(statement_summary, width="stretch")
 
             selected_file = st.selectbox("选择要删除的账单文件", files, key="delete_statement_file")
             file_count = len(history_df[history_df["source_file"] == selected_file])
@@ -1312,7 +559,11 @@ with tab5:
                 if not confirm_delete:
                     st.error("请先勾选确认删除")
                 else:
-                    delete_statement_by_file(user_id, selected_file)
+                    delete_transactions_by_statement(
+                        user_id,
+                        selected_file,
+                        supabase
+                    )
                     st.success(f"已删除：{selected_file}")
                     st.rerun()
 
